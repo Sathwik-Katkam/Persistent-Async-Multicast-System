@@ -1,7 +1,7 @@
 import java.io.*;
 import java.net.*;
 import java.util.*;
-
+import java.util.concurrent.*;
 
 public class Coordinator {
     private int port;
@@ -11,12 +11,12 @@ public class Coordinator {
     private final List<Integer> activeParticipants = new ArrayList<>();
     private final Map<Long, String> messageMap = new TreeMap<>();
     private final Map<Long, List<Integer>> nonMessageRecipients = new TreeMap<>();
+    private final ExecutorService threadPool = Executors.newFixedThreadPool(10); // Thread pool with 10 threads
 
     public Coordinator(int port, int timeout) {
         this.port = port;
         this.timeout = timeout;
     }
-
 
     public void start() {
         try {
@@ -25,13 +25,14 @@ public class Coordinator {
 
             while (true) {
                 Socket socket = serverSocket.accept();
-                new Thread(new WorkerThread(socket, timeout)).start();
+                threadPool.execute(new WorkerThread(socket, timeout)); // Use thread pool instead of new Thread
             }
         } catch (IOException e) {
             System.err.println("Coordinator Error: " + e.getMessage());
+        } finally {
+            threadPool.shutdown();
         }
     }
-
 
     public static void main(String[] args) {
         if (args.length != 1) {
@@ -47,7 +48,6 @@ public class Coordinator {
             System.err.println("Configuration file not found: " + args[0]);
         }
     }
-
 
     private class WorkerThread implements Runnable {
         private Socket socket;
@@ -66,7 +66,6 @@ public class Coordinator {
             }
         }
 
-
         @Override
         public void run() {
             try {
@@ -76,19 +75,18 @@ public class Coordinator {
             } catch (IOException e) {
                 System.err.println("WorkerThread Connection Error: " + (e.getMessage() != null ? e.getMessage() : "No message"));
                 try {
-                    out.writeUTF("Error processing request: " + (e.getMessage() != null ? e.getMessage() : "Unknown error"));
+                    out.writeUTF("Error processing request: " + e.getMessage());
                     out.flush();
                 } catch (IOException ignored) {}
             } finally {
                 try {
-                    Thread.sleep(100);
+                    Thread.sleep(100); // Small delay before closing
                     socket.close();
                 } catch (InterruptedException | IOException e) {
                     System.err.println("Error closing socket: " + e.getMessage());
                 }
             }
         }
-
 
         private void handleRequest(String input) throws IOException {
             String[] parts = input.split("#");
@@ -118,8 +116,6 @@ public class Coordinator {
             }
         }
 
-
-
         private void registerParticipant(int id, String ip, int port) throws IOException {
             String response;
             if (participantMap.containsKey(id)) {
@@ -130,6 +126,7 @@ public class Coordinator {
                     participantMap.put(id, participantSocket);
                     activeParticipants.add(id);
                     response = "Participant registered";
+                    resendPendingMessages(id, participantSocket);
                 } catch (IOException e) {
                     System.err.println("Failed to connect to participant " + id + " at " + ip + ":" + port + ": " + e.getMessage());
                     response = "Registration failed: " + e.getMessage();
@@ -138,8 +135,6 @@ public class Coordinator {
             out.writeUTF(response);
             out.flush();
         }
-
-
 
         private void deregisterParticipant(int id) throws IOException {
             String response;
@@ -157,9 +152,6 @@ public class Coordinator {
             out.flush();
         }
 
-
-
-
         private void reconnectParticipant(int id, String ip, int port) throws IOException {
             String response;
             if (participantMap.containsKey(id) && !activeParticipants.contains(id)) {
@@ -174,8 +166,6 @@ public class Coordinator {
             out.writeUTF(response);
             out.flush();
         }
-
-
 
         private void disconnectParticipant(int id) throws IOException {
             String response;
@@ -193,10 +183,14 @@ public class Coordinator {
             out.flush();
         }
 
-
-
         private void multicastMessage(String message, int senderID) throws IOException {
-            boolean allSent = true;
+            if (!activeParticipants.contains(senderID)) {
+                out.writeUTF("Cannot send: participant not active");
+                out.flush();
+                return;
+            }
+
+            boolean atLeastOneSent = false;
             List<Integer> failedParticipants = new ArrayList<>();
             for (Integer participantID : activeParticipants) {
                 Socket socket = participantMap.get(participantID);
@@ -206,13 +200,11 @@ public class Coordinator {
                         participantOut.writeUTF(message);
                         participantOut.writeUTF("eof");
                         participantOut.flush();
+                        atLeastOneSent = true;
                     } catch (IOException e) {
                         System.err.println("Failed to send to participant " + participantID + ": " + e.getMessage());
                         failedParticipants.add(participantID);
-                        allSent = false;
                     }
-                } else {
-                    allSent = false;
                 }
             }
             for (Integer id : failedParticipants) {
@@ -220,18 +212,16 @@ public class Coordinator {
                     participantMap.get(id).close();
                 }
                 participantMap.put(id, null);
-                activeParticipants.remove(id);
+                activeParticipants.remove((Integer) id);
             }
-            if (allSent) {
+            if (atLeastOneSent) {
                 out.writeUTF("Message Acknowledged");
             } else {
-                out.writeUTF("Message delivery failed to some participants");
+                out.writeUTF("Message delivery failed to all participants");
             }
             saveMessageForOfflineParticipants(message, senderID);
             out.flush();
         }
-
-
 
         private void saveMessageForOfflineParticipants(String message, int senderID) {
             long timestamp = System.currentTimeMillis();
@@ -244,8 +234,6 @@ public class Coordinator {
             }
             nonMessageRecipients.put(timestamp, nonRecipients);
         }
-
-
 
         private void resendPendingMessages(int participantID, Socket socket) throws IOException {
             DataOutputStream resendOut = new DataOutputStream(socket.getOutputStream());

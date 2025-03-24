@@ -2,7 +2,6 @@ import java.io.*;
 import java.net.*;
 import java.util.Scanner;
 
-
 public class Participant {
     private int uniqueID;
     private String coordinatorIP;
@@ -10,7 +9,6 @@ public class Participant {
     private BufferedReader userInput;
     private String logFile;
     private ReceiverThread receiverThread;
-
 
     public Participant(int id, String logFile, String address, int port) {
         this.uniqueID = id;
@@ -20,12 +18,10 @@ public class Participant {
         startConnection();
     }
 
-
     private void startConnection() {
         userInput = new BufferedReader(new InputStreamReader(System.in));
-        new Thread(this::handleUserCommands, "Thread-A").start(); // Thread-A for user commands
+        new Thread(this::handleUserCommands, "Thread-A").start();
     }
-
 
     private void handleUserCommands() {
         try {
@@ -52,8 +48,6 @@ public class Participant {
         }
     }
 
-
-
     private void processCommand(String command) {
         String[] parts = command.split(" ", 2);
         String action = parts[0];
@@ -78,14 +72,24 @@ public class Participant {
                     }
                     int listenPort = Integer.parseInt(parts[1]);
                     ReceiverThread newReceiverThread = new ReceiverThread(logFile, listenPort);
-                    Thread.sleep(100); // Ensure Thread-B starts
+                    Thread.sleep(100); // Allow thread to attempt binding
+                    if (!newReceiverThread.isListening()) {
+                        System.out.println("Failed to bind to port " + listenPort);
+                        newReceiverThread.stopThread();
+                        return;
+                    }
                     coordinatorOutput.writeUTF("register#" + uniqueID + "#" + InetAddress.getLocalHost().getHostAddress() + "#" + listenPort);
                     coordinatorOutput.flush();
                     response = coordinatorInput.readUTF();
                     if (response.equals("Participant registered")) {
+                        System.out.println("Listening on port " + listenPort);
+                        if (receiverThread != null) {
+                            receiverThread.stopThread();
+                        }
                         receiverThread = newReceiverThread;
                     } else {
                         newReceiverThread.stopThread();
+                        System.out.println(response);
                     }
                     break;
 
@@ -97,9 +101,13 @@ public class Participant {
                         receiverThread.stopThread();
                         receiverThread = null;
                     }
+                    System.out.println(response);
                     break;
 
                 case "disconnect":
+                    if (receiverThread != null) {
+                        receiverThread.setShuttingDown(); // Signal shutdown before sending
+                    }
                     coordinatorOutput.writeUTF("disconnect#" + uniqueID);
                     coordinatorOutput.flush();
                     response = coordinatorInput.readUTF();
@@ -107,6 +115,7 @@ public class Participant {
                         receiverThread.stopThread();
                         receiverThread = null;
                     }
+                    System.out.println(response);
                     break;
 
                 case "reconnect":
@@ -116,14 +125,24 @@ public class Participant {
                     }
                     listenPort = Integer.parseInt(parts[1]);
                     newReceiverThread = new ReceiverThread(logFile, listenPort);
-                    Thread.sleep(100);
+                    Thread.sleep(100); // Allow thread to attempt binding
+                    if (!newReceiverThread.isListening()) {
+                        System.out.println("Failed to bind to port " + listenPort);
+                        newReceiverThread.stopThread();
+                        return;
+                    }
                     coordinatorOutput.writeUTF("reconnect#" + uniqueID + "#" + InetAddress.getLocalHost().getHostAddress() + "#" + listenPort);
                     coordinatorOutput.flush();
                     response = coordinatorInput.readUTF();
                     if (response.equals("Participant reconnected")) {
+                        System.out.println("Listening on port " + listenPort);
+                        if (receiverThread != null) {
+                            receiverThread.stopThread();
+                        }
                         receiverThread = newReceiverThread;
                     } else {
                         newReceiverThread.stopThread();
+                        System.out.println(response);
                     }
                     break;
 
@@ -136,13 +155,14 @@ public class Participant {
                     coordinatorOutput.writeUTF("msend#" + uniqueID + "#" + message);
                     coordinatorOutput.flush();
                     response = coordinatorInput.readUTF();
+                    System.out.println(response);
                     break;
 
                 default:
                     response = "Invalid command";
+                    System.out.println(response);
                     break;
             }
-            System.out.println(response); // Print response once here
         } catch (SocketTimeoutException e) {
             System.err.println("Command timed out: " + e.getMessage());
             System.out.println("Command timed out");
@@ -163,8 +183,6 @@ public class Participant {
         }
     }
 
-
-
     public static void main(String[] args) {
         if (args.length != 1) {
             System.out.println("Usage: java Participant <config_file>");
@@ -182,33 +200,28 @@ public class Participant {
     }
 }
 
-
-
 class ReceiverThread implements Runnable {
     private ServerSocket serverSocket;
     private int port;
     private String fileName;
     private volatile boolean running = true;
+    private volatile boolean isShuttingDown = false;
+    private volatile boolean isListening = false; // Track binding success
     private Socket clientSocket;
     private DataInputStream input;
     private FileOutputStream fileOut;
 
-
-
     ReceiverThread(String fileName, int port) {
         this.fileName = fileName;
         this.port = port;
-        new Thread(this, "Thread-B").start(); // Thread-B for receiving messages
+        new Thread(this, "Thread-B").start();
     }
-
-
 
     @Override
     public void run() {
         try {
             serverSocket = new ServerSocket(port);
-            System.out.println("Listening on port " + port);
-
+            isListening = true; // Binding succeeded
             while (running) {
                 try {
                     clientSocket = serverSocket.accept();
@@ -217,13 +230,13 @@ class ReceiverThread implements Runnable {
 
                     while (running) {
                         String message = input.readUTF();
-                        if (message.equals("eof")) continue; // Stay in loop after eof
+                        if (message.equals("eof")) continue;
                         System.out.println("Received: " + message);
                         fileOut.write((message + "\n").getBytes());
                         fileOut.flush();
                     }
                 } catch (IOException e) {
-                    if (running) {
+                    if (running && !isShuttingDown) {
                         System.err.println("Receiver error during message read: " + (e.getMessage() != null ? e.getMessage() : "No message"));
                     }
                 } finally {
@@ -237,15 +250,23 @@ class ReceiverThread implements Runnable {
                 }
             }
         } catch (IOException e) {
-            if (running) {
+            if (running && !isShuttingDown) {
                 System.err.println("Receiver error on startup: " + e.getMessage());
             }
+            isListening = false; // Binding failed
         }
     }
 
+    public boolean isListening() {
+        return isListening;
+    }
 
+    public void setShuttingDown() {
+        isShuttingDown = true;
+    }
 
     public void stopThread() {
+        isShuttingDown = true;
         running = false;
         try {
             if (serverSocket != null && !serverSocket.isClosed()) {
