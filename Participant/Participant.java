@@ -94,6 +94,9 @@ public class Participant {
                     break;
 
                 case "deregister":
+                    if (receiverThread != null) {
+                        receiverThread.setShuttingDown(); // Signal shutdown before sending
+                    }
                     coordinatorOutput.writeUTF("deregister#" + uniqueID);
                     coordinatorOutput.flush();
                     response = coordinatorInput.readUTF();
